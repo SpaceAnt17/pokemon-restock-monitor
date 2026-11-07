@@ -1,67 +1,70 @@
+
 const https = require("https");
 
-/**
- * Send a Telegram message.
- */
-function sendTelegram(message) {
+function sendDiscord(message) {
   return new Promise((resolve) => {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const webhook = process.env.DISCORD_WEBHOOK_URL;
 
-    if (!token || !chatId) {
-      resolve({
+    if (!webhook) {
+      return resolve({
         sent: false,
-        error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+        error: "Missing DISCORD_WEBHOOK_URL",
       });
-      return;
+    }
+
+    let url;
+    try {
+      url = new URL(webhook);
+      if (
+        url.protocol !== "https:" ||
+        !["discord.com", "discordapp.com"].includes(url.hostname) ||
+        !url.pathname.startsWith("/api/webhooks/")
+      ) {
+        throw new Error("Invalid Discord webhook URL");
+      }
+    } catch {
+      return resolve({
+        sent: false,
+        error: "Invalid Discord webhook URL",
+      });
     }
 
     const data = JSON.stringify({
-      chat_id: chatId,
-      text: message,
-      disable_web_page_preview: false,
+      content: message.slice(0, 2000),
+      allowed_mentions: { parse: [] },
     });
 
     const request = https.request(
+      url,
       {
-        hostname: "api.telegram.org",
-        path: `/bot${token}/sendMessage`,
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(data),
         },
+        timeout: 10000,
       },
       (response) => {
         let body = "";
-
-        response.on("data", (chunk) => {
-          body += chunk;
-        });
-
+        response.on("data", chunk => body += chunk);
         response.on("end", () => {
-          if (
-            response.statusCode >= 200 &&
-            response.statusCode < 300
-          ) {
-            resolve({
-              sent: true,
-            });
-          } else {
-            resolve({
-              sent: false,
-              error: `Telegram HTTP ${response.statusCode}: ${body}`,
-            });
-          }
+          resolve({
+            sent: response.statusCode >= 200 &&
+                  response.statusCode < 300,
+            error: response.statusCode >= 300
+              ? `Discord HTTP ${response.statusCode}: ${body.slice(0, 300)}`
+              : undefined,
+          });
         });
       }
     );
 
-    request.on("error", (error) => {
-      resolve({
-        sent: false,
-        error: error.message,
-      });
+    request.on("timeout", () => {
+      request.destroy(new Error("Discord request timed out"));
+    });
+
+    request.on("error", error => {
+      resolve({ sent: false, error: error.message });
     });
 
     request.write(data);
@@ -69,122 +72,54 @@ function sendTelegram(message) {
   });
 }
 
-
-/**
- * Format a product restock alert.
- */
 function formatProduct(product) {
-  const retailer =
-    product.retailer ||
-    product.store ||
-    product.source ||
-    "Unknown retailer";
+  const retailer = product.retailer || product.store ||
+                   product.source || "Unknown retailer";
+  const name = product.name || product.title || "Pokemon product";
+  const url = product.url || product.link || "";
+  const price = product.price || product.currentPrice || "";
 
-  const name =
-    product.name ||
-    product.title ||
-    "Pokemon product";
+  let message = "🚨 **POKÉMON RESTOCK ALERT** 🚨\n\n" +
+                `🏪 ${retailer}\n📦 ${name}`;
 
-  const url =
-    product.url ||
-    product.link ||
-    "";
-
-  const price =
-    product.price ||
-    product.currentPrice ||
-    "";
-
-  let message =
-    "🚨 POKÉMON RESTOCK ALERT 🚨\n\n" +
-    `🏪 ${retailer}\n` +
-    `📦 ${name}`;
-
-  if (price) {
-    message += `\n💰 ${price}`;
-  }
-
-  if (url) {
-    message += `\n\n🔗 ${url}`;
-  }
+  if (price) message += `\n💰 ${price}`;
+  if (url) message += `\n🔗 ${url}`;
 
   return message;
 }
 
-
-/**
- * Format a Pokemon Center queue alert.
- */
-function formatCritical(queueEvent) {
-  let message =
-    "🚨🚨 POKÉMON CENTER QUEUE DETECTED 🚨🚨\n\n" +
-    "Pokemon Center may be preparing for a product release/restock.";
-
-  if (queueEvent?.position != null) {
-    message += `\n📍 Queue position: ${queueEvent.position}`;
-  }
-
-  if (queueEvent?.waitTime) {
-    message += `\n⏱️ Estimated wait: ${queueEvent.waitTime}`;
-  }
-
-  return message;
-}
-
-
-/**
- * Send product notifications.
- *
- * monitor.js expects an object containing channel results.
- */
 async function notify(products) {
   if (!products || products.length === 0) {
-    return {
-      telegram: {
-        sent: false,
-      },
-    };
+    return { discord: { sent: false } };
   }
 
-  const results = {};
+  let result = { sent: false };
 
   for (const product of products) {
-    const message = formatProduct(product);
-
-    console.log(
-      `Sending Telegram alert: ${product.name || product.title}`
-    );
-
-    results.telegram = await sendTelegram(message);
-
-    // Avoid sending a large burst of messages.
-    await new Promise((resolve) =>
-      setTimeout(resolve, 500)
-    );
+    result = await sendDiscord(formatProduct(product));
+    if (result.error) console.error("Discord:", result.error);
+    await new Promise(resolve => setTimeout(resolve, 1200));
   }
 
-  return results;
+  return { discord: result };
 }
 
-
-/**
- * Send critical Pokemon Center queue notification.
- */
 async function notifyCritical(queueEvent) {
-  const message = formatCritical(queueEvent);
+  let message = "🚨🚨 **POKÉMON CENTER QUEUE DETECTED** 🚨🚨\n\n" +
+                "Pokémon Center may be preparing for a release or restock.";
 
-  console.log(
-    "Sending Telegram Pokemon Center queue alert"
-  );
+  if (queueEvent?.position != null) {
+    message += `\n📍 Position: ${queueEvent.position}`;
+  }
+  if (queueEvent?.waitTime) {
+    message += `\n⏱️ Wait: ${queueEvent.waitTime}`;
+  }
 
-  return {
-    telegram: await sendTelegram(message),
-  };
+  return { discord: await sendDiscord(message) };
 }
-
 
 module.exports = {
   notify,
   notifyCritical,
-  sendTelegram,
+  sendDiscord,
 };
