@@ -1,405 +1,829 @@
+
 /**
- * Walmart scraper — parses the __NEXT_DATA__ JSON blob embedded in Walmart's
- * server-side-rendered search pages.
+ * Walmart Pokemon TCG Restock Scraper
  *
- * Session note:
- *   Walmart returns a "Robot or human?" Cloudflare challenge (200 but no product
- *   data) if cookies aren't present. The fix is to first hit the Walmart homepage
- *   to receive session cookies, then carry them into every subsequent search
- *   request. The scraper handles this automatically via initSession().
+ * Features:
+ * - Walmart search-page extraction
+ * - First-party Walmart seller filtering
+ * - Detailed seller diagnostics
+ * - Product deduplication
+ * - Online stock and preorder detection
+ * - Multiple Pokemon TCG search terms
+ * - Pagination
+ * - Retry and error handling
  *
- * Seller filtering:
- *   item.sellerName === 'Walmart.com' is the only reliable first-party signal.
- *   item.sellerType is null for BOTH Walmart and marketplace sellers so cannot
- *   be used. Walmart's internal sellerId (F55CDC…) is used as a secondary check.
- *
- * Stock status:
- *   item.isOutOfStock (bool) + item.availabilityStatusV2.value ('IN_STOCK' /
- *   'OUT_OF_STOCK') provide reliable stock data. item.preOrder.isPreOrder
- *   surfaces pre-release listings.
- *
- * If __NEXT_DATA__ paths stop working, open a Walmart search page in DevTools,
- * find the <script id="__NEXT_DATA__"> tag, and trace from
- * props.pageProps.initialData.searchResult.itemStacks[].items[].
+ * Compatible with monitor.js and config.js.
  */
 
 const axios = require('axios');
 const config = require('../config');
 const { withRetry, sleep } = require('../utils/retry');
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+const WALMART_BASE = 'https://www.walmart.com';
+const SEARCH_URL = `${WALMART_BASE}/search`;
 
-const WALMART_BASE   = 'https://www.walmart.com';
-const SEARCH_URL     = `${WALMART_BASE}/search`;
+const WALMART_SELLER_ID =
+  'F55CDC31AB754BB68FE0B39041159D63';
 
-// Walmart's own seller ID in their marketplace system — used as backup filter.
-const WALMART_SELLER_ID = 'F55CDC31AB754BB68FE0B39041159D63';
-
-// Search terms focused on TCG products; broader terms first for best coverage.
 const SEARCH_KEYWORDS = [
   'pokemon trading card game',
   'pokemon booster pack',
+  'pokemon booster bundle',
   'pokemon elite trainer box',
   'pokemon tin',
   'pokemon collection box',
 ];
 
-const DELAY_MS   = 2000;  // polite delay between pages; Walmart rate-limits aggressively
+const DELAY_MS = 2000;
 const MAX_RETRIES = 3;
+const DEBUG_SAMPLE_LIMIT = 8;
 
-// ── Session / HTTP ────────────────────────────────────────────────────────────
+const HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/124.0.0.0 Safari/537.36',
 
-const BASE_HEADERS = {
-  'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept':
+    'text/html,application/xhtml+xml,' +
+    'application/xml;q=0.9,*/*;q=0.8',
+
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
-  'Connection':      'keep-alive',
-  'Upgrade-Insecure-Requests': '1',
 };
 
-/**
- * Fetch the Walmart homepage to obtain the session cookies (isoLoc, akavpau_p2)
- * required to bypass Cloudflare bot detection on subsequent requests.
- * Returns a cookie string suitable for the Cookie header.
- */
+// --------------------------------------------------
+// SESSION
+// --------------------------------------------------
+
 async function initSession() {
-  const res = await axios.get(WALMART_BASE + '/', {
-    headers: { ...BASE_HEADERS },
-    timeout: 20000,
-    maxRedirects: 5,
-  });
+  const response = await axios.get(
+    `${WALMART_BASE}/`,
+    {
+      headers: HEADERS,
+      timeout: 20000,
+      maxRedirects: 5,
+    }
+  );
 
-  const cookies = (res.headers['set-cookie'] ?? [])
-    .map(c => c.split(';')[0])
+  const cookies = (
+    response.headers['set-cookie'] || []
+  )
+    .map(cookie => cookie.split(';')[0])
     .join('; ');
-
-  if (!cookies) {
-    throw new Error('[Walmart] Homepage returned no cookies — cannot establish session');
-  }
 
   return cookies;
 }
 
-async function fetchPage(cookieStr, keyword, page) {
+// --------------------------------------------------
+// FETCH SEARCH PAGE
+// --------------------------------------------------
+
+async function fetchPage(cookies, keyword, page) {
   return withRetry(
     async () => {
-      const res = await axios.get(SEARCH_URL, {
-        params:  { q: keyword, page },
-        headers: { ...BASE_HEADERS, Referer: WALMART_BASE + '/', Cookie: cookieStr },
-        timeout: 30000,
-        decompress: true,
-      });
-      return res.data;
+      const response = await axios.get(
+        SEARCH_URL,
+        {
+          params: {
+            q: keyword,
+            page,
+          },
+
+          headers: {
+            ...HEADERS,
+            Referer: `${WALMART_BASE}/`,
+            ...(cookies
+              ? { Cookie: cookies }
+              : {}),
+          },
+
+          timeout: 30000,
+          decompress: true,
+        }
+      );
+
+      if (typeof response.data !== 'string') {
+        throw new Error(
+          'Unexpected Walmart response format'
+        );
+      }
+
+      return response.data;
     },
+
     {
       maxAttempts: MAX_RETRIES,
       baseDelayMs: 2000,
-      isRetryable(err) {
-        const status = err.response?.status;
-        return status === 429 || !status || status >= 500 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+
+      isRetryable(error) {
+        const status = error.response?.status;
+
+        return (
+          status === 429 ||
+          status >= 500 ||
+          !status ||
+          error.code === 'ECONNRESET' ||
+          error.code === 'ETIMEDOUT'
+        );
       },
-      getDelay(err, attempt, baseDelayMs) {
-        if (err.response?.status === 429) return 5000 * (2 ** (attempt - 1));  // 5s, 10s
-        return baseDelayMs * (2 ** (attempt - 1));
+
+      onRetry(error, attempt, delay) {
+        console.warn(
+          `[Walmart] Retry ${attempt}: ` +
+          `${error.message}. Waiting ${delay}ms`
+        );
       },
-      onRetry(err, attempt, delayMs) {
-        if (err.response?.status === 429) {
-          console.warn(`[Walmart] Rate limited (429) — backing off ${delayMs / 1000}s…`);
-        } else {
-          console.warn(`[Walmart] Attempt ${attempt} failed (${err.message}) — retrying in ${delayMs / 1000}s…`);
-        }
-      },
-    },
+    }
   );
 }
 
-// ── Data extraction ───────────────────────────────────────────────────────────
+// --------------------------------------------------
+// EXTRACT NEXT DATA
+// --------------------------------------------------
 
 function parseNextData(html) {
-  const match = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (!match) return null;
+  if (typeof html !== 'string') {
+    return null;
+  }
+
+  const match = html.match(
+    /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
+  );
+
+  if (!match) {
+    return null;
+  }
+
   try {
     return JSON.parse(match[1]);
-  } catch {
+  } catch (error) {
+    console.warn(
+      '[Walmart] Could not parse __NEXT_DATA__:',
+      error.message
+    );
+
     return null;
   }
 }
 
+// --------------------------------------------------
+// EXTRACT PRODUCTS
+// --------------------------------------------------
+
 function extractItems(nextData) {
-  const itemStacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks ?? [];
-  return itemStacks.flatMap(stack => stack.items ?? []).filter(i => i?.usItemId);
+  const stacks =
+    nextData?.props?.pageProps?.initialData
+      ?.searchResult?.itemStacks || [];
+
+  return stacks
+    .flatMap(stack => stack.items || [])
+    .filter(item => item && item.usItemId);
 }
 
 function extractPagination(nextData) {
-  const sr = nextData?.props?.pageProps?.initialData?.searchResult ?? {};
+  const result =
+    nextData?.props?.pageProps?.initialData
+      ?.searchResult || {};
+
   return {
-    maxPage:      sr?.paginationV2?.maxPage ?? 1,
-    hasMorePages: sr?.hasMorePages ?? false,
-    total:        sr?.aggregatedCount ?? sr?.count ?? 0,
+    maxPage: result.paginationV2?.maxPage || 1,
+    hasMorePages: result.hasMorePages || false,
+    total:
+      result.aggregatedCount ||
+      result.count ||
+      0,
   };
 }
 
-// ── Seller filtering ──────────────────────────────────────────────────────────
+// --------------------------------------------------
+// SELLER INFORMATION
+// --------------------------------------------------
 
-/**
- * Returns true when the item is sold directly by Walmart.com.
- *
- * Reliable signals (from live API inspection):
- *   item.sellerName === 'Walmart.com'       — primary check
- *   item.sellerId   === WALMART_SELLER_ID   — secondary / backup
- *
- * NOT reliable: item.sellerType is null for both Walmart and marketplace sellers.
- * NOT reliable: item.catalogSellerId is undefined for Walmart AND some 3P sellers.
- */
+function getSellerInfo(item) {
+  return {
+    sellerName: item.sellerName ?? null,
+    sellerId: item.sellerId ?? null,
+    sellerType: item.sellerType ?? null,
+    catalogSellerId:
+      item.catalogSellerId ?? null,
+
+    sellerDisplayName:
+      item.sellerDisplayName ?? null,
+
+    seller:
+      item.seller ?? null,
+  };
+}
+
+// --------------------------------------------------
+// WALMART FIRST-PARTY CHECK
+// --------------------------------------------------
+
 function isSoldByWalmart(item) {
-  if (item.sellerName === 'Walmart.com') return true;
-  if (item.sellerId   === WALMART_SELLER_ID) return true;
+  const sellerName = String(
+    item.sellerName || ''
+  ).trim().toLowerCase();
+
+  const sellerId = String(
+    item.sellerId || ''
+  ).trim().toUpperCase();
+
+  const sellerDisplayName = String(
+    item.sellerDisplayName || ''
+  ).trim().toLowerCase();
+
+  const catalogSellerId = String(
+    item.catalogSellerId || ''
+  ).trim().toUpperCase();
+
+  if (sellerName === 'walmart.com') {
+    return true;
+  }
+
+  if (sellerDisplayName === 'walmart.com') {
+    return true;
+  }
+
+  if (sellerId === WALMART_SELLER_ID) {
+    return true;
+  }
+
+  if (catalogSellerId === WALMART_SELLER_ID) {
+    return true;
+  }
+
   return false;
 }
 
-/**
- * Walmart's search returns sponsored non-Pokemon items (board games, electronics)
- * as "Walmart.com"-sold results alongside actual TCG products. Filter to items
- * whose name actually contains "pokemon" so we don't false-positive on them.
- */
+// --------------------------------------------------
+// POKEMON PRODUCT FILTER
+// --------------------------------------------------
+
 function isPokemonProduct(item) {
-  return (item.name ?? '').toLowerCase().includes('pokemon')
-      || (item.name ?? '').toLowerCase().includes('pokémon');
+  const name = String(
+    item.name || ''
+  ).toLowerCase();
+
+  return (
+    name.includes('pokemon') ||
+    name.includes('pokémon')
+  );
 }
 
-// ── Stock status ──────────────────────────────────────────────────────────────
+// --------------------------------------------------
+// STOCK STATUS
+// --------------------------------------------------
 
-/**
- * Derives one of three statuses from Walmart item fields.
- *   'pre_order'    — item.preOrder.isPreOrder is true
- *   'in_stock'     — isOutOfStock false AND availabilityStatusV2.value IN_STOCK
- *   'out_of_stock' — isOutOfStock true OR value OUT_OF_STOCK
- */
 function getStockStatus(item) {
-  if (item.preOrder?.isPreOrder === true) return 'pre_order';
+  if (item.preOrder?.isPreOrder === true) {
+    return 'pre_order';
+  }
 
-  const avStatus  = item.availabilityStatusV2?.value ?? '';
-  const isOOS     = item.isOutOfStock === true;
+  const availability = String(
+    item.availabilityStatusV2?.value || ''
+  ).toUpperCase();
 
-  if (isOOS || avStatus === 'OUT_OF_STOCK') return 'out_of_stock';
-  if (avStatus === 'IN_STOCK')              return 'in_stock';
+  if (
+    item.isOutOfStock === true ||
+    availability === 'OUT_OF_STOCK'
+  ) {
+    return 'out_of_stock';
+  }
 
-  // Fallback: if we can add to cart the item is likely in stock
-  if (item.canAddToCart === true || item.showAtc === true) return 'in_stock';
+  if (availability === 'IN_STOCK') {
+    return 'in_stock';
+  }
+
+  if (
+    item.canAddToCart === true ||
+    item.showAtc === true
+  ) {
+    return 'in_stock';
+  }
 
   return 'out_of_stock';
 }
 
-// ── Normalisation ─────────────────────────────────────────────────────────────
+// --------------------------------------------------
+// PRODUCT URL
+// --------------------------------------------------
 
 function buildUrl(item) {
-  const canonical = item.canonicalUrl ?? '';
-  // Strip marketplace condition params that don't apply to Walmart-sold items
-  const cleanPath = canonical.split('?')[0];
-  return cleanPath ? `${WALMART_BASE}${cleanPath}` : `${WALMART_BASE}/ip/${item.usItemId}`;
+  const canonical = String(
+    item.canonicalUrl || ''
+  ).split('?')[0];
+
+  if (canonical.startsWith('https://www.walmart.com/')) {
+    return canonical;
+  }
+
+  if (canonical.startsWith('/')) {
+    return `${WALMART_BASE}${canonical}`;
+  }
+
+  return `${WALMART_BASE}/ip/${item.usItemId}`;
 }
 
+// --------------------------------------------------
+// PRICE
+// --------------------------------------------------
+
 function buildPrice(item) {
-  // item.price is a raw number; priceInfo.linePrice is formatted "$X.XX"
-  const raw       = item.price;
-  const formatted = item.priceInfo?.linePrice ?? '';
-  const numeric   = raw != null ? Number(raw) : parseFloat(formatted.replace(/[^0-9.]/g, '')) || null;
-  const wasPrice  = item.priceInfo?.wasPrice ? item.priceInfo.wasPrice.replace(/['"]/g, '') : null;
+  const raw = item.price;
+
+  const formatted =
+    item.priceInfo?.linePrice || '';
+
+  let numeric = null;
+
+  if (raw !== null && raw !== undefined) {
+    const parsed = Number(raw);
+
+    if (Number.isFinite(parsed)) {
+      numeric = parsed;
+    }
+  }
+
+  if (numeric === null && formatted) {
+    const parsed = parseFloat(
+      String(formatted).replace(/[^0-9.]/g, '')
+    );
+
+    if (Number.isFinite(parsed)) {
+      numeric = parsed;
+    }
+  }
+
+  const wasPrice =
+    item.priceInfo?.wasPrice || null;
 
   return {
-    price:        numeric != null ? `$${numeric.toFixed(2)}` : 'N/A',
+    price:
+      numeric !== null
+        ? `$${numeric.toFixed(2)}`
+        : 'N/A',
+
     priceNumeric: numeric,
-    regularPrice: wasPrice ?? null,
+
+    regularPrice:
+      wasPrice !== null
+        ? String(wasPrice)
+        : null,
   };
 }
 
+// --------------------------------------------------
+// PICKUP STATUS
+// --------------------------------------------------
+
 function getPickupStatus(item) {
-  // pickupMethod: 'PICKUP' when the item supports store pickup
-  const fulfillment = item.fulfillmentBadges ?? item.fulfillmentType ?? '';
-  const pickupAvail = item.pickupAndDeliveryStoreInfo?.pickupStores?.[0]?.available;
-  if (pickupAvail === true)  return 'in_stock';
-  if (pickupAvail === false) return 'out_of_stock';
-  // Simpler flag
-  const badge = (Array.isArray(item.fulfillmentBadges) ? item.fulfillmentBadges : [])
-    .map(b => (b ?? '').toLowerCase());
-  if (badge.includes('pickup_today') || badge.includes('free_pickup_today')) return 'in_stock';
+  const pickup =
+    item.pickupAndDeliveryStoreInfo
+      ?.pickupStores?.[0]?.available;
+
+  if (pickup === true) {
+    return 'in_stock';
+  }
+
+  if (pickup === false) {
+    return 'out_of_stock';
+  }
+
+  const badges = Array.isArray(
+    item.fulfillmentBadges
+  )
+    ? item.fulfillmentBadges
+    : [];
+
+  const normalized = badges
+    .filter(badge => typeof badge === 'string')
+    .map(badge => badge.toLowerCase());
+
+  if (
+    normalized.includes('pickup_today') ||
+    normalized.includes('free_pickup_today')
+  ) {
+    return 'in_stock';
+  }
+
   return null;
 }
 
-function normalizeItem(item) {
-  const stockStatus  = getStockStatus(item);
-  const { price, priceNumeric, regularPrice } = buildPrice(item);
-  const preorder     = item.preOrder ?? {};
+// --------------------------------------------------
+// NORMALIZE PRODUCT
+// --------------------------------------------------
 
-  return {
-    id:             `walmart-${item.usItemId}`,
-    retailer:       'walmart',
-    usItemId:       item.usItemId,
-    name:           item.name ?? '',
-    brand:          item.brand ?? null,
+function normalizeItem(item) {
+  const stockStatus = getStockStatus(item);
+
+  const {
     price,
     priceNumeric,
     regularPrice,
-    url:            buildUrl(item),
-    inStock:        stockStatus === 'in_stock',
-    stockStatus,    // 'in_stock' | 'out_of_stock' | 'pre_order'
-    pickupStatus:   getPickupStatus(item),  // 'in_stock' | 'out_of_stock' | null
-    releaseDate:    preorder.streetDate ?? preorder.releaseDate ?? null,
+  } = buildPrice(item);
+
+  return {
+    id: `walmart-${item.usItemId}`,
+
+    retailer: 'walmart',
+
+    usItemId: item.usItemId,
+
+    name: item.name || '',
+
+    brand: item.brand || null,
+
+    price,
+    priceNumeric,
+    regularPrice,
+
+    url: buildUrl(item),
+
+    inStock: stockStatus === 'in_stock',
+
+    stockStatus,
+
+    pickupStatus: getPickupStatus(item),
+
+    releaseDate:
+      item.preOrder?.streetDate ||
+      item.preOrder?.releaseDate ||
+      null,
   };
 }
 
-// ── Main scraper ──────────────────────────────────────────────────────────────
+// --------------------------------------------------
+// DEBUG SELLER INFORMATION
+// --------------------------------------------------
+
+function debugSellers(items, keyword) {
+  console.log(
+    `\n[Walmart DEBUG] Seller samples: ${keyword}`
+  );
+
+  const samples = items.slice(
+    0,
+    DEBUG_SAMPLE_LIMIT
+  );
+
+  for (const item of samples) {
+    console.log(
+      '[Walmart DEBUG]',
+      JSON.stringify(
+        {
+          name: item.name,
+          usItemId: item.usItemId,
+
+          ...getSellerInfo(item),
+
+          recognizedAsWalmart:
+            isSoldByWalmart(item),
+
+          isPokemon:
+            isPokemonProduct(item),
+
+          availability:
+            item.availabilityStatusV2,
+
+          isOutOfStock:
+            item.isOutOfStock,
+
+          canAddToCart:
+            item.canAddToCart,
+        },
+        null,
+        2
+      )
+    );
+  }
+}
+
+// --------------------------------------------------
+// MAIN SCRAPER
+// --------------------------------------------------
 
 async function scrapeWalmart() {
-  console.log('[Walmart] Initialising session…');
-  let cookies;
+  console.log(
+    '\n[Walmart] Starting Pokemon TCG monitor'
+  );
+
+  let cookies = '';
+
   try {
     cookies = await initSession();
-    console.log('[Walmart] Session ready');
-  } catch (err) {
-    console.error(`[Walmart] Session init failed: ${err.message}`);
-    return [];
+
+    console.log(
+      '[Walmart] Session initialized'
+    );
+  } catch (error) {
+    console.warn(
+      '[Walmart] Session initialization failed:',
+      error.message
+    );
+
+    throw error;
   }
 
-  await sleep(1000); // brief pause before first search
+  await sleep(1000);
 
-  const products        = [];
-  const seen            = new Set();
-  let   thirdPartyCount = 0;
+  const products = [];
+  const acceptedIds = new Set();
+
+  const sellerCounts = new Map();
+
+  let thirdPartyCount = 0;
+  let nonPokemonCount = 0;
+  let duplicateCount = 0;
+  let pagesSucceeded = 0;
+  let pagesFailed = 0;
+
+  const maxConfiguredPages = Math.max(
+    1,
+    Number(config.maxPages) || 3
+  );
 
   for (const keyword of SEARCH_KEYWORDS) {
-    let page    = 1;
-    let maxPage = Infinity; // set after first response
+    console.log(
+      `\n[Walmart] Searching: "${keyword}"`
+    );
 
-    console.log(`[Walmart] Searching: "${keyword}"`);
+    let page = 1;
+    let maxPage = maxConfiguredPages;
 
-    while (page <= maxPage && page <= config.maxPages) {
+    while (page <= maxPage) {
       let html;
+
       try {
-        html = await fetchPage(cookies, keyword, page);
-      } catch (err) {
-        console.error(`[Walmart] Fetch failed on "${keyword}" page ${page}: ${err.message}`);
+        html = await fetchPage(
+          cookies,
+          keyword,
+          page
+        );
+      } catch (error) {
+        pagesFailed++;
+
+        console.error(
+          `[Walmart] Failed "${keyword}" ` +
+          `page ${page}: ${error.message}`
+        );
+
         break;
       }
 
       const nextData = parseNextData(html);
+
       if (!nextData) {
-        console.warn(`[Walmart] No __NEXT_DATA__ on "${keyword}" page ${page} — bot check may have triggered`);
+        pagesFailed++;
+
+        console.warn(
+          `[Walmart] No valid __NEXT_DATA__ ` +
+          `for "${keyword}" page ${page}`
+        );
+
         break;
       }
+
+      const searchResult =
+        nextData?.props?.pageProps
+          ?.initialData?.searchResult;
+
+      if (
+        !searchResult ||
+        !Array.isArray(searchResult.itemStacks)
+      ) {
+        pagesFailed++;
+
+        console.warn(
+          `[Walmart] Missing expected search data ` +
+          `for "${keyword}" page ${page}`
+        );
+
+        break;
+      }
+
+      pagesSucceeded++;
 
       const items = extractItems(nextData);
       const pagination = extractPagination(nextData);
 
       if (page === 1) {
-        maxPage = Math.min(pagination.maxPage, config.maxPages);
-        console.log(`[Walmart] "${keyword}": ${pagination.total} results, ${pagination.maxPage} pages`);
+        maxPage = Math.min(
+          Number(pagination.maxPage) || 1,
+          maxConfiguredPages
+        );
+
+        console.log(
+          `[Walmart] ${pagination.total} results, ` +
+          `${pagination.maxPage} pages`
+        );
+
+        debugSellers(items, keyword);
       }
 
       if (items.length === 0) {
-        console.log(`[Walmart] Empty page for "${keyword}" page ${page} — stopping`);
+        console.log(
+          `[Walmart] Empty page ${page}`
+        );
+
         break;
       }
 
-      let newCount   = 0;
-      let skipCount  = 0;
+      let added = 0;
+      let skipped = 0;
 
       for (const item of items) {
-        const id = item.usItemId;
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
+        const id = String(
+          item.usItemId || ''
+        );
 
-        if (!isSoldByWalmart(item) || !isPokemonProduct(item)) {
-          if (!isSoldByWalmart(item)) thirdPartyCount++;
-          skipCount++;
+        if (!id) {
+          continue;
+        }
+
+        if (acceptedIds.has(id)) {
+          duplicateCount++;
+          continue;
+        }
+
+        const sellerName = String(
+          item.sellerName ||
+          item.sellerDisplayName ||
+          '(missing)'
+        );
+
+        sellerCounts.set(
+          sellerName,
+          (sellerCounts.get(sellerName) || 0) + 1
+        );
+
+        if (!isPokemonProduct(item)) {
+          nonPokemonCount++;
+          skipped++;
+          continue;
+        }
+
+        if (!isSoldByWalmart(item)) {
+          thirdPartyCount++;
+          skipped++;
           continue;
         }
 
         products.push(normalizeItem(item));
-        newCount++;
+        acceptedIds.add(id);
+        added++;
       }
 
       console.log(
-        `[Walmart] "${keyword}" page ${page}/${maxPage}: ` +
-        `${items.length} items → ${newCount} added, ${skipCount} 3rd-party skipped`,
+        `[Walmart] "${keyword}" ` +
+        `page ${page}/${maxPage}: ` +
+        `${items.length} items, ` +
+        `${added} added, ` +
+        `${skipped} filtered`
       );
 
       page++;
-      if (page <= maxPage && page <= config.maxPages) await sleep(DELAY_MS);
+
+      if (page <= maxPage) {
+        await sleep(DELAY_MS);
+      }
     }
 
-    // Pause between keywords to reduce risk of rate-limiting
-    if (SEARCH_KEYWORDS.indexOf(keyword) < SEARCH_KEYWORDS.length - 1) await sleep(DELAY_MS * 2);
+    await sleep(DELAY_MS * 2);
   }
 
-  const inStock    = products.filter(p => p.stockStatus === 'in_stock').length;
-  const outOfStock = products.filter(p => p.stockStatus === 'out_of_stock').length;
-  const preOrder   = products.filter(p => p.stockStatus === 'pre_order').length;
+  if (pagesSucceeded === 0) {
+    throw new Error(
+      '[Walmart] All search pages failed. ' +
+      'No reliable product data obtained.'
+    );
+  }
+
+  // Avoid treating a partially failed scrape as
+  // a complete inventory snapshot.
+  if (pagesFailed > 0) {
+    throw new Error(
+      `[Walmart] Incomplete scrape: ` +
+      `${pagesFailed} page(s) failed. ` +
+      'Skipping inventory comparison.'
+    );
+  }
+
+  const inStock = products.filter(
+    product => product.stockStatus === 'in_stock'
+  ).length;
+
+  const outOfStock = products.filter(
+    product => product.stockStatus === 'out_of_stock'
+  ).length;
+
+  const preOrder = products.filter(
+    product => product.stockStatus === 'pre_order'
+  ).length;
 
   console.log(
-    `[Walmart] Done: ${products.length} Walmart-sold products ` +
-    `(${inStock} in-stock, ${outOfStock} OOS, ${preOrder} pre-order, ${thirdPartyCount} 3rd-party skipped)`,
+    '\n[Walmart] Seller breakdown:'
+  );
+
+  const sortedSellers = [
+    ...sellerCounts.entries(),
+  ].sort((a, b) => b[1] - a[1]);
+
+  for (const [seller, count] of sortedSellers.slice(0, 20)) {
+    console.log(
+      `[Walmart] ${seller}: ${count}`
+    );
+  }
+
+  console.log(
+    '\n[Walmart] Final summary'
+  );
+
+  console.log(
+    `[Walmart] Pages succeeded: ${pagesSucceeded}`
+  );
+
+  console.log(
+    `[Walmart] Products accepted: ${products.length}`
+  );
+
+  console.log(
+    `[Walmart] In stock: ${inStock}`
+  );
+
+  console.log(
+    `[Walmart] Out of stock: ${outOfStock}`
+  );
+
+  console.log(
+    `[Walmart] Preorders: ${preOrder}`
+  );
+
+  console.log(
+    `[Walmart] Third-party filtered: ${thirdPartyCount}`
+  );
+
+  console.log(
+    `[Walmart] Non-Pokemon filtered: ${nonPokemonCount}`
+  );
+
+  console.log(
+    `[Walmart] Duplicate accepted listings: ${duplicateCount}`
   );
 
   return products;
 }
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-// node scrapers/walmart.js            → run and show 5 sample products
-// node scrapers/walmart.js --all      → show all products
-// node scrapers/walmart.js --json     → output raw JSON
+// --------------------------------------------------
+// COMMAND LINE
+// --------------------------------------------------
 
 if (require.main === module) {
-  const args    = process.argv.slice(2);
+  const args = process.argv.slice(2);
+
   const showAll = args.includes('--all');
-  const asJson  = args.includes('--json');
+  const asJson = args.includes('--json');
 
   scrapeWalmart()
     .then(products => {
       if (asJson) {
-        console.log(JSON.stringify(products, null, 2));
+        console.log(
+          JSON.stringify(products, null, 2)
+        );
         return;
       }
 
-      const sample = showAll ? products : products.slice(0, 5);
+      const sample = showAll
+        ? products
+        : products.slice(0, 5);
 
-      console.log(`\n${'─'.repeat(70)}`);
-      console.log(`Walmart Pokemon TCG — ${sample.length} of ${products.length} products shown`);
-      console.log(`  In-stock:    ${products.filter(p => p.stockStatus === 'in_stock').length}`);
-      console.log(`  Out-of-stock: ${products.filter(p => p.stockStatus === 'out_of_stock').length}`);
-      console.log(`  Pre-order:   ${products.filter(p => p.stockStatus === 'pre_order').length}`);
-      console.log('─'.repeat(70));
+      console.log(
+        `\nWalmart Pokemon TCG: ` +
+        `${products.length} products`
+      );
 
-      if (sample.length === 0) {
-        console.log('\nNo Walmart-sold products found in this search batch.');
-        console.log('Note: Walmart\'s Pokemon TCG inventory is currently dominated by marketplace');
-        console.log('sellers. Walmart-sold items may appear on later pages (increase MAX_PAGES)');
-        console.log('or when new products are released directly through Walmart.');
-        return;
+      for (const product of sample) {
+        console.log(
+          `\n${product.name}\n` +
+          `Price: ${product.price}\n` +
+          `Status: ${product.stockStatus}\n` +
+          `URL: ${product.url}`
+        );
       }
-
-      sample.forEach((p, i) => {
-        const statusLabel = {
-          in_stock:     '✅ In Stock',
-          out_of_stock: '❌ OOS',
-          pre_order:    '🔜 Pre-order',
-        }[p.stockStatus] ?? p.stockStatus;
-
-        console.log(`\n[${i + 1}] ${p.name}`);
-        console.log(`    Brand:  ${p.brand ?? 'N/A'}`);
-        console.log(`    Price:  ${p.price}${p.regularPrice ? ` (was ${p.regularPrice})` : ''}`);
-        console.log(`    Status: ${statusLabel}`);
-        if (p.releaseDate) console.log(`    Release: ${p.releaseDate}`);
-        console.log(`    URL:    ${p.url}`);
-      });
-      console.log(`\n${'─'.repeat(70)}`);
     })
-    .catch(err => {
-      console.error('[Walmart] Fatal:', err.message);
-      process.exit(1);
+    .catch(error => {
+      console.error(
+        '[Walmart] Fatal error:',
+        error.message
+      );
+
+      process.exitCode = 1;
     });
 }
+
+// --------------------------------------------------
+// EXPORTS
+// --------------------------------------------------
 
 module.exports = {
   scrapeWalmart,
