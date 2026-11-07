@@ -1,31 +1,14 @@
 
-/**
- * Target Pokémon TCG Restock Monitor
- *
- * Uses Target's Redsky search endpoint.
- *
- * Improvements:
- * - Failed requests stop the scan
- * - Incomplete inventory scans are rejected
- * - HTTP errors are reported clearly
- * - Failed stock checks cannot mark everything OOS
- * - Existing monitor.js compatibility preserved
- */
-
 const axios = require('axios');
 const config = require('../config');
 const { withRetry, sleep } = require('../utils/retry');
 
-// API configuration
+// Target Redsky API configuration
 const REDSKY_BASE =
   'https://redsky.target.com/redsky_aggregations/v1/web/plp_search_v2';
 
-const REDSKY_KEY =
-  '9f36aeafbe60771e321a7cc95a78140772ab3e96';
-
-const VISITOR_ID =
-  '018c8d4b-a1b7-7e65-8e16-e60f2a64b4a6';
-
+const REDSKY_KEY = '9f36aeafbe60771e321a7cc95a78140772ab3e96';
+const VISITOR_ID = '018c8d4b-a1b7-7e65-8e16-e60f2a64b4a6';
 const STORE_ID = '1375';
 
 const COUNT = 24;
@@ -35,11 +18,13 @@ const MAX_RETRIES = 3;
 const SEARCH_KEYWORD = 'pokemon cards';
 
 const REQUEST_HEADERS = {
-  'User-Agent': config.requestHeaders['User-Agent'],
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'application/json',
   'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
   'Referer':
-    'https://www.target.com/s?searchTerm=pokemon%20cards',
+    `https://www.target.com/s?searchTerm=${encodeURIComponent(SEARCH_KEYWORD)}`,
   'Origin': 'https://www.target.com',
 };
 
@@ -61,36 +46,79 @@ const BASE_PARAMS = {
   include_sponsored: true,
 };
 
-// Fetch Target product data
+// Diagnostic logging
+function logHttpError(err) {
+  const response = err.response;
+
+  console.error('\n[Target DEBUG] Request failed');
+
+  console.error({
+    status: response?.status ?? null,
+    statusText: response?.statusText ?? null,
+    contentType: response?.headers?.['content-type'] ?? null,
+    retryAfter: response?.headers?.['retry-after'] ?? null,
+    server: response?.headers?.server ?? null,
+    errorCode: err.code ?? null,
+    message: err.message,
+  });
+
+  const body = response?.data;
+
+  if (body != null) {
+    const output = typeof body === 'string'
+      ? body
+      : JSON.stringify(body);
+
+    console.error(
+      '[Target DEBUG] Response body:',
+      output.slice(0, 1000)
+    );
+  }
+
+  console.error('[Target DEBUG] End\n');
+}
+
+// Fetch Redsky data
 async function fetchRedsky(params) {
   return withRetry(
     async () => {
       try {
-        const response = await axios.get(REDSKY_BASE, {
-          params: { ...BASE_PARAMS, ...params },
+        const res = await axios.get(REDSKY_BASE, {
+          params: {
+            ...BASE_PARAMS,
+            ...params,
+          },
           headers: REQUEST_HEADERS,
           timeout: 22000,
+          decompress: true,
         });
 
-        if (!response.data?.data?.search) {
-          throw new Error(
-            'Target returned an unexpected response format'
-          );
-        }
-
-        return response.data;
+        return res.data;
       } catch (err) {
+        logHttpError(err);
+
         const status = err.response?.status;
 
-        if (status) {
+        if (status === 400) {
+          const message =
+            err.response?.data?.errors?.[0]?.message ??
+            'Bad Request';
+
           const error = new Error(
-            `Target API returned HTTP ${status}`
+            `[Target] Redsky 400: ${message}`
           );
 
-          error.status = status;
-          error.permanent =
-            status >= 400 && status < 500 && status !== 429;
+          error.permanent = true;
+          throw error;
+        }
 
+        if (status === 403 || status === 435) {
+          const error = new Error(
+            `[Target] API returned HTTP ${status}. ` +
+            'Request rejected by server.'
+          );
+
+          error.permanent = true;
           throw error;
         }
 
@@ -104,30 +132,29 @@ async function fetchRedsky(params) {
       isRetryable(err) {
         if (err.permanent) return false;
 
-        if (err.status === 429) return false;
+        const status = err.response?.status;
 
-        if (err.status) {
-          return err.status >= 500;
-        }
+        if (status === 429) return false;
 
-        return [
-          'ECONNRESET',
-          'ETIMEDOUT',
-          'ECONNABORTED',
-        ].includes(err.code);
+        return (
+          !status ||
+          status >= 500 ||
+          err.code === 'ECONNRESET' ||
+          err.code === 'ETIMEDOUT'
+        );
       },
 
       onRetry(err, attempt, delayMs) {
         console.warn(
-          `[Target] Attempt ${attempt} failed: ${err.message}. ` +
-          `Retrying in ${delayMs / 1000}s`
+          `[Target] Attempt ${attempt} failed: ` +
+          `${err.message}. Retrying in ${delayMs / 1000}s`
         );
       },
     }
   );
 }
 
-// Retrieve product pages
+// Fetch paginated products
 async function fetchAllTcins(purchasabilityFilter) {
   const label = purchasabilityFilter
     ? 'in-stock'
@@ -136,12 +163,13 @@ async function fetchAllTcins(purchasabilityFilter) {
   const tcins = new Map();
 
   let offset = 0;
-  let total = null;
+  let total = Infinity;
   let page = 0;
 
-  const maxPages = Math.max(1, config.maxPages || 3);
-
-  while (page < maxPages) {
+  while (
+    offset < total &&
+    page < config.maxPages
+  ) {
     let data;
 
     try {
@@ -153,64 +181,53 @@ async function fetchAllTcins(purchasabilityFilter) {
       });
     } catch (err) {
       console.error(
-        `[Target] ${label} page ${page + 1} failed: ` +
-        err.message
+        `[Target] ${label} page ${page + 1} failed: ${err.message}`
       );
 
-      // Never interpret failed requests as empty stock.
+      // Do not mistake a blocked request for
+      // an empty inventory.
       throw err;
     }
 
-    const search = data.data.search;
-    const items = search.products;
-
-    if (!Array.isArray(items)) {
-      throw new Error(
-        `[Target] Invalid product list in ${label} scan`
-      );
-    }
-
-    const metadata =
-      search.search_response?.metadata || {};
+    const search = data?.data?.search ?? {};
+    const items = search.products ?? [];
+    const meta =
+      search.search_response?.metadata ?? {};
 
     if (page === 0) {
-      total = metadata.total_results;
+      total = meta.total_results ?? items.length;
 
       console.log(
-        `[Target] ${label}: ` +
-        `${total ?? 'unknown'} total results`
+        `[Target] ${label}: ${total} results`
       );
     }
 
+    if (items.length === 0) break;
+
     for (const raw of items) {
-      const tcin = raw?.tcin || raw?.item?.tcin;
+      const tcin =
+        raw?.tcin ?? raw?.item?.tcin;
 
       if (tcin) {
         tcins.set(String(tcin), raw);
       }
     }
 
-    page++;
     offset += COUNT;
+    page++;
 
-    if (items.length === 0) break;
-
-    if (total != null && offset >= total) break;
-
-    if (page < maxPages) {
+    if (
+      offset < total &&
+      page < config.maxPages
+    ) {
       await sleep(DELAY_MS);
     }
   }
 
-  return {
-    products: tcins,
-    total,
-    complete:
-      total != null && offset >= total,
-  };
+  return tcins;
 }
 
-// Exclude third-party sellers
+// Exclude Target Plus third-party sellers
 function isSoldByTarget(raw) {
   if (
     raw?.item?.fulfillment?.is_marketplace === true
@@ -219,28 +236,31 @@ function isSoldByTarget(raw) {
   }
 
   const relationship =
-    raw?.item?.relationship_type || '';
+    raw?.item?.relationship_type ?? '';
 
-  return ![
-    'TargetPlus',
-    'TargetPlus_CollectionItem',
-  ].includes(relationship);
+  return (
+    relationship !== 'TargetPlus' &&
+    relationship !== 'TargetPlus_CollectionItem'
+  );
 }
 
 // Detect preorders
 function isPreOrder(raw) {
-  const type =
-    raw?.price?.formatted_current_price_type || '';
+  const priceType =
+    raw?.price?.formatted_current_price_type ?? '';
 
-  return ['pre_order', 'preorder'].includes(type);
+  return (
+    priceType === 'pre_order' ||
+    priceType === 'preorder'
+  );
 }
 
 // Build product URL
 function buildUrl(raw) {
   const buyUrl =
-    raw?.item?.enrichment?.buy_url || '';
+    raw?.item?.enrichment?.buy_url ?? '';
 
-  if (buyUrl.startsWith('https://')) {
+  if (buyUrl.startsWith('http')) {
     return buyUrl;
   }
 
@@ -248,44 +268,56 @@ function buildUrl(raw) {
     return `https://www.target.com${buyUrl}`;
   }
 
-  const tcin = raw?.tcin || raw?.item?.tcin;
+  const tcin =
+    raw?.tcin ?? raw?.item?.tcin;
 
   return `https://www.target.com/p/-/A-${tcin}`;
 }
 
-// Local store inventory
+// Detect in-store availability
 function getInStoreStatus(raw) {
   const options =
-    raw?.item?.fulfillment?.store_options || [];
+    raw?.item?.fulfillment?.store_options ?? [];
 
-  const store = options.find(
-    item => String(item.location_id) === STORE_ID
-  );
+  const store =
+    options.find(
+      option =>
+        String(option.location_id) === STORE_ID
+    ) ?? options[0];
 
   if (!store) return null;
 
   const status =
-    store?.availability?.availability_status ||
-    store?.order_pickup?.availability
-      ?.availability_status ||
+    store?.availability?.availability_status ??
+    store?.order_pickup?.availability?.availability_status ??
     '';
 
-  if (status === 'IN_STOCK') return 'in_stock';
-  if (status === 'OUT_OF_STOCK') return 'out_of_stock';
+  if (!status) return null;
 
-  return status ? status.toLowerCase() : null;
+  if (status === 'IN_STOCK') {
+    return 'in_stock';
+  }
+
+  if (status === 'OUT_OF_STOCK') {
+    return 'out_of_stock';
+  }
+
+  return status.toLowerCase();
 }
 
-// Convert Target product data into monitor format
+// Normalize product data
 function normalizeProduct(raw, stockStatus) {
-  const tcin = raw?.tcin || raw?.item?.tcin;
+  const tcin =
+    raw?.tcin ?? raw?.item?.tcin;
 
   const name =
-    raw?.item?.product_description?.title ||
-    'Pokémon Product';
+    raw?.item?.product_description?.title ?? '';
 
-  const price = raw?.price?.current_retail;
-  const regular = raw?.price?.reg_retail;
+  const price =
+    raw?.price?.current_retail;
+
+  const regularPrice =
+    raw?.price?.reg_retail;
 
   return {
     id: `target-${tcin}`,
@@ -294,11 +326,11 @@ function normalizeProduct(raw, stockStatus) {
 
     name: name.replace(
       /&#(\d+);/g,
-      (_, number) => String.fromCharCode(number)
+      (_, n) => String.fromCharCode(n)
     ),
 
     brand:
-      raw?.item?.primary_brand?.name || null,
+      raw?.item?.primary_brand?.name ?? null,
 
     price:
       price != null
@@ -308,72 +340,65 @@ function normalizeProduct(raw, stockStatus) {
     priceNumeric: price ?? null,
 
     regularPrice:
-      regular != null && regular !== price
-        ? `$${Number(regular).toFixed(2)}`
+      regularPrice != null &&
+      regularPrice !== price
+        ? `$${Number(regularPrice).toFixed(2)}`
         : null,
 
     url: buildUrl(raw),
 
-    inStock: stockStatus === 'in_stock',
+    inStock:
+      stockStatus === 'in_stock',
+
     stockStatus,
 
-    inStoreStatus: getInStoreStatus(raw),
+    inStoreStatus:
+      getInStoreStatus(raw),
 
     releaseDate: null,
   };
 }
 
-// Main Target scraper
+// Main scraper
 async function scrapeTarget() {
   console.log(
-    `[Target] Starting Pokémon scan: ${SEARCH_KEYWORD}`
+    `[Target] Starting Pokemon scan: ${SEARCH_KEYWORD}`
   );
 
-  const allResult = await fetchAllTcins(false);
+  // Pass 1: discover products
+  const allPass = await fetchAllTcins(false);
 
-  if (allResult.products.size === 0) {
-    throw new Error(
-      'Target returned no products. Scan rejected.'
+  if (allPass.size === 0) {
+    console.warn(
+      '[Target] No products returned. ' +
+      'Check API response and search parameters.'
     );
+
+    return [];
   }
 
   await sleep(DELAY_MS * 2);
 
-  const stockResult = await fetchAllTcins(true);
-
-  // Search results are capped at maxPages.
-  // Missing products cannot safely be marked OOS
-  // unless both searches were complete.
-  const canConfirmMissing =
-    allResult.complete && stockResult.complete;
-
-  if (!canConfirmMissing) {
-    console.warn(
-      '[Target] Partial search results: ' +
-      'missing products will not be marked OOS.'
-    );
-  }
+  // Pass 2: identify purchasable products
+  const inStockPass = await fetchAllTcins(true);
 
   const products = [];
+  let thirdPartyCount = 0;
 
-  for (const [tcin, raw] of allResult.products) {
-    if (!isSoldByTarget(raw)) continue;
+  for (const [tcin, raw] of allPass) {
+    if (!isSoldByTarget(raw)) {
+      thirdPartyCount++;
+      continue;
+    }
 
     let stockStatus;
 
     if (isPreOrder(raw)) {
       stockStatus = 'pre_order';
-    } else if (stockResult.products.has(tcin)) {
+    } else if (inStockPass.has(tcin)) {
       stockStatus = 'in_stock';
-    } else if (canConfirmMissing) {
-      stockStatus = 'out_of_stock';
     } else {
-      // Avoid false stock-status changes.
-      // Do not feed unknown stock into state comparison.
-      throw new Error(
-        'Target stock results incomplete; ' +
-        'scan rejected to protect inventory state.'
-      );
+      stockStatus = 'out_of_stock';
     }
 
     products.push(
@@ -381,14 +406,29 @@ async function scrapeTarget() {
     );
   }
 
-  console.log(
-    `[Target] Scan complete: ${products.length} products`
-  );
+  const inStock = products.filter(
+    p => p.stockStatus === 'in_stock'
+  ).length;
+
+  const outOfStock = products.filter(
+    p => p.stockStatus === 'out_of_stock'
+  ).length;
+
+  const preOrder = products.filter(
+    p => p.stockStatus === 'pre_order'
+  ).length;
+
+  const inStore = products.filter(
+    p => p.inStoreStatus === 'in_stock'
+  ).length;
 
   console.log(
-    `[Target] In stock: ${
-      products.filter(p => p.inStock).length
-    }`
+    `[Target] Done: ${products.length} products ` +
+    `(${inStock} online in-stock, ` +
+    `${inStore} in-store, ` +
+    `${outOfStock} out-of-stock, ` +
+    `${preOrder} preorder, ` +
+    `${thirdPartyCount} third-party skipped)`
   );
 
   return products;
@@ -396,19 +436,31 @@ async function scrapeTarget() {
 
 // Standalone test
 if (require.main === module) {
+  const args = process.argv.slice(2);
+
   scrapeTarget()
     .then(products => {
       console.log(
-        JSON.stringify(products.slice(0, 5), null, 2)
+        `[Target] Scan completed: ${products.length} products`
       );
+
+      if (args.includes('--json')) {
+        console.log(
+          JSON.stringify(products, null, 2)
+        );
+      } else {
+        console.log(
+          JSON.stringify(products.slice(0, 5), null, 2)
+        );
+      }
     })
     .catch(err => {
       console.error(
-        '[Target] Scan failed:',
+        '[Target] Fatal:',
         err.message
       );
 
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
 
